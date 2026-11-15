@@ -5,6 +5,7 @@ import android.view.SurfaceHolder
 import com.uniplay.core.*
 
 class ProjectionMediaRenderer(
+    private val isForceMediaStream: () -> Boolean = { false },
     private val onFirstFrameRendered: (width: Int, height: Int) -> Unit,
     private val onSessionEnded: (reason: String) -> Unit
 ) : SurfaceHolder.Callback, MediaSink {
@@ -101,11 +102,17 @@ class ProjectionMediaRenderer(
 
     /** The existing track if it still fits the stream, otherwise a fresh one. */
     private fun LeanAudioTrack?.matching(channel: AudioChannel, sampleRate: Int, channels: Int): LeanAudioTrack {
-        if (this != null && this.channel == channel && this.sampleRate == sampleRate && this.channelCount == channels) {
+        val forceMedia = isForceMediaStream()
+        if (this != null &&
+            this.channel == channel &&
+            this.sampleRate == sampleRate &&
+            this.channelCount == channels &&
+            this.forceMediaStream == forceMedia
+        ) {
             return this
         }
         this?.stop()
-        return LeanAudioTrack(channel, sampleRate, channels)
+        return LeanAudioTrack(channel, sampleRate, channels, forceMediaStream = forceMedia)
     }
 
     override fun onSessionTerminated(reason: String) {

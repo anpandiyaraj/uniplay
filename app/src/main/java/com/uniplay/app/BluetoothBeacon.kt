@@ -1,9 +1,11 @@
 package com.uniplay.app
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.content.Intent
 import android.util.Log
 
 /**
@@ -28,6 +30,15 @@ class BluetoothBeacon(private val context: Context) {
         get() = bluetoothAdapter?.isEnabled == true
 
     @SuppressLint("MissingPermission")
+    fun hasBondedDevices(): Boolean {
+        return try {
+            !bluetoothAdapter?.bondedDevices.isNullOrEmpty()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun getDeviceName(): String {
         return try {
             bluetoothAdapter?.name ?: DEFAULT_BEACON_NAME
@@ -49,6 +60,21 @@ class BluetoothBeacon(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start Bluetooth beacon", e)
             return false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun requestDiscoverable(activity: Activity, durationSeconds: Int = 300): Boolean {
+        if (bluetoothAdapter == null) return false
+        return try {
+            val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, durationSeconds)
+            }
+            activity.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not request Bluetooth discoverable mode: ${e.message}")
+            false
         }
     }
 

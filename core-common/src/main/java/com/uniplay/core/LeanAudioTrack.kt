@@ -1,5 +1,6 @@
 package com.uniplay.core
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -11,13 +12,35 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
+ * Audio routing preferences for projection playback.
+ * On consumer phones, forcing [AudioManager.STREAM_MUSIC] prevents navigation/assistant
+ * channels from routing to the phone's earpiece instead of the speaker or Bluetooth audio.
+ */
+object AudioSettings {
+    private const val PREFS = "audio"
+    private const val KEY_FORCE_MEDIA_STREAM = "force_media_stream"
+
+    fun isForceMediaStream(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_FORCE_MEDIA_STREAM, false)
+
+    fun setForceMediaStream(context: Context, force: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_FORCE_MEDIA_STREAM, force)
+            .apply()
+    }
+}
+
+/**
  * Lean AudioTrack wrapper for low-RAM automotive playback.
  * Uses small buffers to minimize latency (< 40ms) and keep memory < 2MB.
  */
 class LeanAudioTrack(
     val channel: AudioChannel,
     val sampleRate: Int = 48000,
-    val channelCount: Int = 2
+    val channelCount: Int = 2,
+    val forceMediaStream: Boolean = false
 ) {
     companion object {
         private const val TAG = "LeanAudioTrack"
@@ -49,19 +72,7 @@ class LeanAudioTrack(
         val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
         val bufferSize = (minBufferSize * 2).coerceAtLeast(4096)
 
-        val usage = when (channel) {
-            AudioChannel.NAVIGATION -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
-            AudioChannel.SPEECH_SIRI_ASSISTANT -> AudioAttributes.USAGE_ASSISTANT
-            AudioChannel.MEDIA -> AudioAttributes.USAGE_MEDIA
-        }
-
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(usage)
-            .setContentType(
-                if (channel == AudioChannel.MEDIA) AudioAttributes.CONTENT_TYPE_MUSIC
-                else AudioAttributes.CONTENT_TYPE_SPEECH
-            )
-            .build()
+        val audioAttributes = buildAudioAttributes()
 
         val audioFormat = AudioFormat.Builder()
             .setSampleRate(sampleRate)
@@ -89,7 +100,33 @@ class LeanAudioTrack(
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             writeLoop(track)
         }, "UniplayAudio-$channel").apply { start() }
-        Log.i(TAG, "AudioTrack started for $channel ($sampleRate Hz, buffer: ${bufferSize}b)")
+        Log.i(TAG, "AudioTrack started for $channel ($sampleRate Hz, forceMediaStream=$forceMediaStream, buffer: ${bufferSize}b)")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buildAudioAttributes(): AudioAttributes {
+        if (forceMediaStream) {
+            return AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setLegacyStreamType(AudioManager.STREAM_MUSIC)
+                .build()
+        }
+
+        val usage = when (channel) {
+            AudioChannel.NAVIGATION -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+            AudioChannel.SPEECH_SIRI_ASSISTANT -> AudioAttributes.USAGE_ASSISTANT
+            AudioChannel.MEDIA -> AudioAttributes.USAGE_MEDIA
+        }
+        val contentType = if (channel == AudioChannel.MEDIA) {
+            AudioAttributes.CONTENT_TYPE_MUSIC
+        } else {
+            AudioAttributes.CONTENT_TYPE_SPEECH
+        }
+        return AudioAttributes.Builder()
+            .setUsage(usage)
+            .setContentType(contentType)
+            .build()
     }
 
     /** Queues [pcmData] for playback and returns at once. The array must not be reused. */

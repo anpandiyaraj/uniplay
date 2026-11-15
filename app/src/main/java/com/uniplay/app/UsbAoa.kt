@@ -116,6 +116,12 @@ class UsbTransportChannel(
     @Volatile
     private var closed = false
 
+    // USB bulk IN transfers must be at least maxPacketSize (typically 512B); smaller
+    // requests (like 6B header reads) fail with -EOVERFLOW when the phone sends more.
+    private val rxStaging = ByteArray(maxOf(MAX_CHUNK, inEndpoint.maxPacketSize.coerceAtLeast(512)))
+    private var rxPos = 0
+    private var rxLen = 0
+
     override val type: TransportType = TransportType.USB
 
     override val inputStream: InputStream = object : InputStream() {
@@ -126,11 +132,23 @@ class UsbTransportChannel(
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
             if (length == 0) return 0
+            if (rxPos < rxLen) {
+                val n = minOf(length, rxLen - rxPos)
+                System.arraycopy(rxStaging, rxPos, buffer, offset, n)
+                rxPos += n
+                return n
+            }
             while (!closed) {
                 // A finite timeout, so close() ends a read that is waiting on a quiet cable.
                 val started = System.nanoTime()
-                val n = connection.bulkTransfer(inEndpoint, buffer, offset, minOf(length, MAX_CHUNK), 1000)
-                if (n > 0) return n
+                val n = connection.bulkTransfer(inEndpoint, rxStaging, 0, rxStaging.size, 1000)
+                if (n > 0) {
+                    val copy = minOf(length, n)
+                    System.arraycopy(rxStaging, 0, buffer, offset, copy)
+                    rxPos = copy
+                    rxLen = n
+                    return copy
+                }
                 // bulkTransfer returns -1 for both a timeout and a real error (unplugged
                 // phone). An error comes back at once; a timeout takes the full second.
                 val waitedMs = (System.nanoTime() - started) / 1_000_000

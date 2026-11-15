@@ -1,5 +1,6 @@
 package com.uniplay.app
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Color
 import android.hardware.usb.UsbDevice
@@ -36,6 +37,13 @@ class ProjectionSessionController(
 
     fun getBluetoothDeviceName(): String = bluetoothBeacon.getDeviceName()
 
+    fun isBluetoothEnabled(): Boolean = bluetoothBeacon.isBluetoothEnabled
+
+    fun hasBondedBluetoothDevices(): Boolean = bluetoothBeacon.hasBondedDevices()
+
+    fun requestBluetoothDiscoverable(activity: Activity): Boolean =
+        bluetoothBeacon.requestDiscoverable(activity)
+
     fun startWirelessServices(localIp: String, btName: String) {
         if (isWirelessInitialized.getAndSet(true)) return
 
@@ -56,45 +64,116 @@ class ProjectionSessionController(
     /** Set by the UI: asks the user for hotspot details when none could be found automatically. */
     var onHotspotSetupNeeded: () -> Unit = {}
 
-    private val localHotspot = LocalHotspot(context)
+    /** Set by the UI: updates the displayed IP badge when hotspot/gateway IP changes. */
+    var onResolvedIpChanged: (String) -> Unit = {}
+
+    private val localHotspot = LocalHotspot(context).apply {
+        onStoppedUnexpectedly = {
+            onStatusUpdate("Local hotspot stopped by Android. Restarting...", Color.parseColor("#F0B46A"))
+        }
+    }
+
+    /** Restarts Auto hotspot + handoff if Android stopped it while the screen was backgrounded. */
+    fun ensureHotspotActive() {
+        if (hotspot.mode == HotspotMode.AUTO && !hotspot.isConfigured && !localHotspot.isActive) {
+            startAndroidAutoHandoff(NetworkUtils.getLocalIpAddress(context))
+        }
+    }
 
     /**
-     * (Re)starts the Bluetooth handoff that tells the phone which Wi-Fi to join.
-     * Typed-in hotspot details win; otherwise the app starts a hotspot of its own and
-     * uses that, and only asks the user when this head unit cannot do so.
-     * Safe to call again after the user saves details or grants a permission.
+     * (Re)starts the wireless handoff according to [HotspotSettings.mode].
+     * Safe to call again after the user saves settings or grants a permission.
      */
-    fun startAndroidAutoHandoff(localIp: String) {
+    fun startAndroidAutoHandoff(localIp: String = NetworkUtils.getLocalIpAddress(context)) {
         aaWirelessManager?.stop()
         aaWirelessManager = null
 
-        if (hotspot.isConfigured) {
-            beginHandoff(hotspot.ssid, hotspot.psk, localIp)
-            return
+        when (hotspot.mode) {
+            HotspotMode.CLIENT_GATEWAY -> {
+                localHotspot.stop()
+                val gatewayIp = NetworkUtils.getGatewayIp(context)
+                onResolvedIpChanged(gatewayIp)
+                onStatusUpdate(
+                    "Client mode: connecting to phone hotspot at $gatewayIp...",
+                    Color.parseColor("#8FB2FF")
+                )
+                connectDirectToPhone(manual = false, gatewayIp = gatewayIp, hasStreamStarted = false)
+                return
+            }
+
+            HotspotMode.PHONE_HOTSPOT -> {
+                localHotspot.stop()
+                if (!hotspot.isConfigured) {
+                    onStatusUpdate(
+                        "Phone hotspot mode: enter this phone's hotspot name & password.",
+                        Color.parseColor("#F0B46A")
+                    )
+                    onHotspotSetupNeeded()
+                    return
+                }
+                val apIp = NetworkUtils.getApIpAddress() ?: localIp
+                onResolvedIpChanged(apIp)
+                beginHandoff(hotspot.ssid, hotspot.psk, apIp, hotspot.bssid)
+                return
+            }
+
+            HotspotMode.AUTO -> {
+                if (hotspot.isConfigured) {
+                    localHotspot.stop()
+                    val ip = NetworkUtils.getApIpAddress() ?: localIp
+                    onResolvedIpChanged(ip)
+                    beginHandoff(hotspot.ssid, hotspot.psk, ip, hotspot.bssid)
+                    return
+                }
+            }
         }
 
         onStatusUpdate("Starting the car hotspot...", Color.parseColor("#8FB2FF"))
         localHotspot.start(
             onReady = { creds ->
-                beginHandoff(creds.ssid, creds.psk, creds.ip)
+                onResolvedIpChanged(creds.ip)
+                beginHandoff(creds.ssid, creds.psk, creds.ip, creds.bssid)
             },
             onFailed = { reason ->
                 Log.w(TAG, "Automatic hotspot unavailable: $reason")
-                onStatusUpdate("$reason. Enter your hotspot details instead.", Color.parseColor("#F0B46A"))
-                onHotspotSetupNeeded()
+                if (NetworkUtils.isWifiConnected(context)) {
+                    val gatewayIp = NetworkUtils.getGatewayIp(context)
+                    onResolvedIpChanged(NetworkUtils.getLocalIpAddress(context))
+                    onStatusUpdate(
+                        "Connected to Wi-Fi; trying phone at $gatewayIp (or waiting on port ${WirelessServer.PORT_MAIN})...",
+                        Color.parseColor("#8FB2FF")
+                    )
+                    connectDirectToPhone(manual = false, gatewayIp = gatewayIp, hasStreamStarted = false)
+                } else {
+                    onStatusUpdate("$reason. Enter your hotspot details instead.", Color.parseColor("#F0B46A"))
+                    onHotspotSetupNeeded()
+                }
             }
         )
     }
 
-    private fun beginHandoff(ssid: String, psk: String, ip: String) {
+    private fun beginHandoff(ssid: String, psk: String, ip: String, bssid: String = "") {
         aaWirelessManager?.stop()
-        aaWirelessManager = AndroidAutoWirelessManager(context) { phoneName ->
-            onStatusUpdate(
-                "Bluetooth handshake with $phoneName! Handing off to Wi-Fi...",
-                Color.parseColor("#8FB2FF")
+        aaWirelessManager = AndroidAutoWirelessManager(
+            context = context,
+            onPhoneHandoffInitiated = { phoneName ->
+                onStatusUpdate(
+                    "Bluetooth handshake with $phoneName! Handing off to Wi-Fi...",
+                    Color.parseColor("#8FB2FF")
+                )
+            },
+            onBluetoothError = { reason ->
+                onStatusUpdate(reason, Color.parseColor("#F0B46A"))
+            }
+        ).also {
+            it.start(
+                ssid = ssid,
+                psk = psk,
+                localIp = ip,
+                port = WirelessServer.PORT_MAIN,
+                aggressiveMode = hotspot.aggressiveBluetooth,
+                bssid = bssid
             )
-        }.also {
-            it.start(ssid = ssid, psk = psk, localIp = ip, port = WirelessServer.PORT_MAIN)
         }
         onStatusUpdate("Ready. Waiting for your phone", Color.parseColor("#5FD0A5"))
     }

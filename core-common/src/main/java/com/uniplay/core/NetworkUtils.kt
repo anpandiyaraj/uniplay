@@ -56,6 +56,43 @@ object NetworkUtils {
     }
 
     /**
+     * Resolves the device's Wi-Fi access point (hotspot) IPv4 address if an AP interface is up.
+     */
+    fun getApIpAddress(): String? {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (intf in interfaces) {
+                val name = intf.name.lowercase()
+                val isAp = name.startsWith("ap") || name.startsWith("swlan") ||
+                    name.startsWith("softap") || name == "wlan1"
+                if (!isAp || !intf.isUp) continue
+                for (addr in intf.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        addr.hostAddress?.let { return it }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read access point address: ${e.message}")
+        }
+        return null
+    }
+
+    /**
+     * Detects if device is currently connected to a Wi-Fi network as a client (STA).
+     */
+    @Suppress("DEPRECATION")
+    fun isWifiConnected(context: Context): Boolean {
+        return try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val info = wifiManager?.connectionInfo
+            wifiManager?.isWifiEnabled == true && info != null && info.networkId != -1
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * Detects if device is in Wi-Fi AP (Hotspot) mode.
      */
     fun isHotspotActive(): Boolean {

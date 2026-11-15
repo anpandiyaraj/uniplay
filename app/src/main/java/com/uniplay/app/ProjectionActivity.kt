@@ -19,11 +19,16 @@ import android.util.Log
 import android.view.*
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.app.AlertDialog
+import android.provider.Settings
 import android.text.InputType
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.TextView
 import com.uniplay.core.*
 
@@ -58,6 +63,7 @@ class ProjectionActivity : Activity() {
 
     private var hasStreamStarted = false
     private var permissionsPending = false
+    private var hasPromptedDiscoverable = false
     private var stage = 0
     private lateinit var pulse: PulseView
     private lateinit var stepBadges: List<TextView>
@@ -108,6 +114,7 @@ class ProjectionActivity : Activity() {
         listOf(btnConnectPhone, findViewById<View>(R.id.btn_hotspot_settings), displayMode).forEach(::addPressEffect)
 
         mediaRenderer = ProjectionMediaRenderer(
+            isForceMediaStream = { AudioSettings.isForceMediaStream(this) },
             onFirstFrameRendered = { width, height ->
                 Log.i(TAG, "First video frame rendered (${width}x$height). Projection is live.")
                 runOnUiThread { hideGuideOverlay() }
@@ -128,6 +135,9 @@ class ProjectionActivity : Activity() {
             // While the permission dialog is up the handoff is retried when it closes.
             runOnUiThread { if (!permissionsPending) showHotspotDialog() }
         }
+        sessionController.onResolvedIpChanged = { ip ->
+            runOnUiThread { badgeWifiIp.text = "Wi-Fi  $ip:${WirelessServer.PORT_MAIN}" }
+        }
 
         // Populate live network info into guide badges
         val localIp = NetworkUtils.getLocalIpAddress(this)
@@ -137,6 +147,7 @@ class ProjectionActivity : Activity() {
 
         checkAndRequestPermissions()
         sessionController.startWirelessServices(localIp, btName)
+        if (!permissionsPending) maybePromptDiscoverableIfUnpaired()
         findViewById<View>(R.id.btn_hotspot_settings).setOnClickListener { showHotspotDialog() }
 
         // Manual fallback: connect straight to a phone that runs its own head unit server
@@ -153,6 +164,13 @@ class ProjectionActivity : Activity() {
         handleUsbIntent(intent)
 
         Log.i(TAG, "ProjectionActivity initialized. ${memoryGuard.dumpMemoryStats()}")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (!permissionsPending && !hasStreamStarted) {
+            sessionController.ensureHotspotActive()
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -303,6 +321,7 @@ class ProjectionActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             wanted += Manifest.permission.BLUETOOTH_CONNECT
             wanted += Manifest.permission.BLUETOOTH_SCAN
+            wanted += Manifest.permission.BLUETOOTH_ADVERTISE
         }
         if (Build.VERSION.SDK_INT >= 33) wanted += Manifest.permission.NEARBY_WIFI_DEVICES
         val missing = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
@@ -316,16 +335,56 @@ class ProjectionActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSION_REQ_CODE) {
             permissionsPending = false
+            badgeBluetooth.text = "Bluetooth  ${sessionController.getBluetoothDeviceName()}"
             // Bluetooth just became usable, so the handoff can start for real now.
             sessionController.startAndroidAutoHandoff(NetworkUtils.getLocalIpAddress(this))
+            maybePromptDiscoverableIfUnpaired()
         }
     }
 
-    /** Asks for the head unit hotspot name and password the phone must join. */
+    /** Makes an unpaired device visible over Bluetooth once so the user does not have to hunt in settings. */
+    private fun maybePromptDiscoverableIfUnpaired() {
+        if (hasPromptedDiscoverable) return
+        if (sessionController.hotspot.mode == HotspotMode.CLIENT_GATEWAY) return
+        if (!sessionController.isBluetoothEnabled() || sessionController.hasBondedBluetoothDevices()) return
+        hasPromptedDiscoverable = true
+        sessionController.requestBluetoothDiscoverable(this)
+    }
+
+    /** Configures hotspot mode, phone-to-phone Bluetooth options, and audio stream routing. */
     private fun showHotspotDialog() {
-        val pad = (20 * resources.displayMetrics.density).toInt()
+        val pad = (18 * resources.displayMetrics.density).toInt()
+        val currentMode = sessionController.hotspot.mode
+
+        val modeLabel = TextView(this).apply {
+            text = "Wi-Fi hotspot mode"
+            setPadding(0, 0, 0, pad / 4)
+        }
+        val radioAuto = RadioButton(this).apply {
+            text = "Auto (Head unit local hotspot)"
+            tag = HotspotMode.AUTO
+        }
+        val radioPhoneHotspot = RadioButton(this).apply {
+            text = "Phone hotspot (This phone hosts hotspot)"
+            tag = HotspotMode.PHONE_HOTSPOT
+        }
+        val radioClientGateway = RadioButton(this).apply {
+            text = "Join phone's hotspot (Connect to gateway)"
+            tag = HotspotMode.CLIENT_GATEWAY
+        }
+        val modeGroup = RadioGroup(this).apply {
+            addView(radioAuto)
+            addView(radioPhoneHotspot)
+            addView(radioClientGateway)
+            when (currentMode) {
+                HotspotMode.AUTO -> check(radioAuto.id)
+                HotspotMode.PHONE_HOTSPOT -> check(radioPhoneHotspot.id)
+                HotspotMode.CLIENT_GATEWAY -> check(radioClientGateway.id)
+            }
+        }
+
         val ssid = EditText(this).apply {
-            hint = "Hotspot name"
+            hint = "Hotspot name (SSID)"
             setText(sessionController.hotspot.ssid)
             setSingleLine()
         }
@@ -335,26 +394,99 @@ class ProjectionActivity : Activity() {
             setSingleLine()
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
+        val bssid = EditText(this).apply {
+            hint = "Hotspot BSSID (optional, AA:BB:CC:DD:EE:FF)"
+            setText(sessionController.hotspot.bssid)
+            setSingleLine()
+        }
+        val btnSystemHotspot = Button(this).apply {
+            text = "Open system hotspot settings"
+            isAllCaps = false
+            setOnClickListener { openSystemHotspotSettings() }
+        }
+
+        val btCheck = CheckBox(this).apply {
+            text = "Aggressive Bluetooth RFCOMM (phone-to-phone)"
+            isChecked = sessionController.hotspot.aggressiveBluetooth
+        }
+        val btnBtDiscoverable = Button(this).apply {
+            text = "Make Bluetooth discoverable (5 min)"
+            isAllCaps = false
+            setOnClickListener { sessionController.requestBluetoothDiscoverable(this@ProjectionActivity) }
+        }
+
+        val audioCheck = CheckBox(this).apply {
+            text = "Force media stream (STREAM_MUSIC) for all audio"
+            isChecked = AudioSettings.isForceMediaStream(this@ProjectionActivity)
+        }
+
+        fun updateCredentialVisibility(mode: HotspotMode) {
+            val showCreds = mode != HotspotMode.CLIENT_GATEWAY
+            ssid.isEnabled = showCreds
+            psk.isEnabled = showCreds
+            bssid.isEnabled = showCreds
+            btnSystemHotspot.visibility = if (mode == HotspotMode.PHONE_HOTSPOT) View.VISIBLE else View.GONE
+        }
+        updateCredentialVisibility(currentMode)
+        modeGroup.setOnCheckedChangeListener { group, checkedId ->
+            val selected = group.findViewById<RadioButton>(checkedId)?.tag as? HotspotMode ?: HotspotMode.AUTO
+            updateCredentialVisibility(selected)
+        }
+
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad / 2, pad, 0)
+            addView(modeLabel)
+            addView(modeGroup)
             addView(ssid)
             addView(psk)
+            addView(bssid)
+            addView(btnSystemHotspot)
+            addView(btCheck)
+            addView(btnBtDiscoverable)
+            addView(audioCheck)
         }
+        val container = ScrollView(this).apply { addView(form) }
+
         AlertDialog.Builder(this)
-            .setTitle("Head unit hotspot")
-            .setMessage("Uniplay normally starts the car's hotspot by itself. If your head unit can't, enter the hotspot it shares here; the phone is told to join it over Bluetooth.")
-            .setView(form)
+            .setTitle("Connection & audio settings")
+            .setMessage("Use Auto for car head units. For phone-to-phone, turn on this phone's hotspot, enter its SSID & password, and enable STREAM_MUSIC if audio plays through the earpiece.")
+            .setView(container)
             .setNegativeButton("Cancel", null)
-            .setNeutralButton("Automatic") { _, _ ->
-                sessionController.hotspot.save("", "")
+            .setNeutralButton("Reset to Auto") { _, _ ->
+                sessionController.hotspot.save(HotspotMode.AUTO, "", "", false)
+                AudioSettings.setForceMediaStream(this, false)
                 sessionController.startAndroidAutoHandoff(NetworkUtils.getLocalIpAddress(this))
             }
             .setPositiveButton("Save") { _, _ ->
-                sessionController.hotspot.save(ssid.text.toString(), psk.text.toString())
+                val selectedMode = modeGroup.findViewById<RadioButton>(modeGroup.checkedRadioButtonId)
+                    ?.tag as? HotspotMode ?: HotspotMode.AUTO
+                sessionController.hotspot.save(
+                    mode = selectedMode,
+                    ssid = ssid.text.toString(),
+                    psk = psk.text.toString(),
+                    aggressiveBluetooth = btCheck.isChecked,
+                    bssid = bssid.text.toString()
+                )
+                AudioSettings.setForceMediaStream(this, audioCheck.isChecked)
                 sessionController.startAndroidAutoHandoff(NetworkUtils.getLocalIpAddress(this))
             }
             .show()
+    }
+
+    private fun openSystemHotspotSettings() {
+        val candidates = listOf(
+            Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"),
+            Intent(Settings.ACTION_WIRELESS_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (intent in candidates) {
+            try {
+                startActivity(intent)
+                return
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun hideGuideOverlay() {
